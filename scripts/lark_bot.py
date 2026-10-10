@@ -140,6 +140,20 @@ def format_report(report: dict, name: str) -> str:
     return "\n".join(lines)
 
 
+def display_name(message_type: str, content: dict, name: str) -> str:
+    """What to call the recording in replies.
+
+    Lark keeps the original name only for file attachments. A video or voice
+    message posted straight into the chat is exposed under an internal ID, so
+    those are described by kind and length instead.
+    """
+    kind = {"media": "Video posted in chat", "audio": "Voice message"}.get(message_type)
+    if kind is None:
+        return name
+    seconds = int(content.get("duration") or 0) // 1000
+    return f"{kind} ({seconds // 60}:{seconds % 60:02d})"
+
+
 def handle(message) -> None:
     target, prefix = message.message_id, ""
     try:
@@ -152,7 +166,8 @@ def handle(message) -> None:
         name = Path(content.get("file_name") or f"voice-message.{'opus' if message_type == 'audio' else 'bin'}").name
         # Answer on the file's own message and lead with its name, so each
         # result can be matched to its file when several are checked at once.
-        target, prefix = source_id, f"File: {name}\n"
+        label = display_name(message_type, content, name)
+        target, prefix = source_id, f"File: {label}\n"
         with tempfile.TemporaryDirectory() as folder:
             path = download(source_id, content["file_key"], name, Path(folder))
             reply(target, f"{prefix}Checking. This usually takes under a minute.")
@@ -161,7 +176,7 @@ def handle(message) -> None:
             if r["label"] == "unknown":
                 log.warning("%s: %s gave no verdict: %s", name, provider, r["detail"])
         log.info("%s -> %s", name, report["verdict"])
-        reply(target, format_report(report, name))
+        reply(target, format_report(report, label))
     except UserError as e:
         log.warning("message %s: %s", message.message_id, e)
         reply(target, f"{prefix}Check failed: {e}")
