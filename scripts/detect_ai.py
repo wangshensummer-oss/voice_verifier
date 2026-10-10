@@ -62,13 +62,23 @@ def check(r: requests.Response) -> None:
 
 
 def modulate(path: Path, args: argparse.Namespace) -> dict:
-    with path.open("rb") as f:
-        r = http.post(
-            MODULATE_URL,
-            headers={"X-API-Key": os.environ["MODULATE_API_KEY"]},
-            files={"upload_file": (path.name, f)},
-            timeout=300,
-        )
+    # Cheap and idempotent, so transient failures are worth retrying.
+    for attempt in range(3):
+        try:
+            with path.open("rb") as f:
+                r = http.post(
+                    MODULATE_URL,
+                    headers={"X-API-Key": os.environ["MODULATE_API_KEY"]},
+                    files={"upload_file": (path.name, f)},
+                    timeout=300,
+                )
+        except requests.RequestException:
+            if attempt == 2:
+                raise
+        else:
+            if attempt == 2 or not (r.status_code == 429 or r.status_code >= 500):
+                break
+        time.sleep(2 * (attempt + 1))
     check(r)
     frames = [f for f in r.json()["frames"] if f["verdict"] != "no-content"]
     if not frames:

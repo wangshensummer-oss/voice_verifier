@@ -19,6 +19,7 @@ import logging
 import os
 import sys
 import tempfile
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -30,6 +31,7 @@ detect_ai.load_env()
 os.environ["NO_PROXY"] = os.environ["no_proxy"] = "*"
 
 import lark_oapi as lark
+import requests
 from lark_oapi.api.im.v1 import (
     GetMessageRequest,
     GetMessageResourceRequest,
@@ -47,7 +49,8 @@ VERDICT_TEXT = {
     "PASS": "Real",
     "PASS (single detector)": "Real",
 }
-USAGE = "Send me an audio file directly. In a group, reply to the audio file's message and @ me."
+USAGE = "Send me one audio file directly. In a group, reply to that file's message and @ me. One file per request."
+DOWNLOAD_ATTEMPTS = 3
 DETECT_ARGS = argparse.Namespace(zero_retention=False, timeout=180)
 
 client: lark.Client
@@ -70,6 +73,10 @@ def reply(message_id: str, text: str) -> None:
         log.error("reply failed: %s %s", response.code, response.msg)
 
 
+class UserError(Exception):
+    """A failure whose message says what went wrong and what to do, safe to show in the chat."""
+
+
 def find_audio(message) -> tuple[str, str, dict] | None:
     """Return (message_id, message_type, content) of the audio this message carries or replies to."""
     if message.message_type in AUDIO_MESSAGE_TYPES:
@@ -78,22 +85,47 @@ def find_audio(message) -> tuple[str, str, dict] | None:
         return None
     response = client.im.v1.message.get(GetMessageRequest.builder().message_id(message.parent_id).build())
     if not response.success():
-        log.error("get parent message failed: %s %s", response.code, response.msg)
-        return None
+        raise UserError(
+            f"I could not read the message you replied to ({response.code}: {response.msg}). "
+            "Send the audio file to me directly instead."
+        )
     parent = response.data.items[0]
     if parent.msg_type not in AUDIO_MESSAGE_TYPES:
-        return None
+        raise UserError(
+            f"The message you replied to is not an audio file (it is of type '{parent.msg_type}'). "
+            "Reply to the audio file's own message and @ me."
+        )
     return parent.message_id, parent.msg_type, json.loads(parent.body.content)
 
 
 def download(message_id: str, file_key: str, name: str, folder: Path) -> Path:
     request = GetMessageResourceRequest.builder().message_id(message_id).file_key(file_key).type("file").build()
-    response = client.im.v1.message_resource.get(request)
-    if not response.success():
-        raise RuntimeError(f"could not download the file: {response.code} {response.msg}")
-    path = folder / name
-    path.write_bytes(response.file.read())
-    return path
+    problem = ""
+    for attempt in range(1, DOWNLOAD_ATTEMPTS + 1):
+        try:
+            response = client.im.v1.message_resource.get(request)
+        except requests.RequestException as e:
+            problem = f"network error, {type(e).__name__}"
+        else:
+            if response.success():
+                path = folder / name
+                path.write_bytes(response.file.read())
+                return path
+            if response.code is not None:
+                # Lark answered with its own error; asking again will not change it.
+                raise UserError(
+                    f"Lark refused the download ({response.code}: {response.msg}). "
+                    "Download the recording and resend it to me as a file."
+                )
+            # Lark's gateway times out now and then (HTTP 504 with an empty body) when
+            # several downloads run at once; the same request succeeds moments later.
+            problem = f"HTTP {response.raw.status_code} from Lark"
+        log.warning("download of %s failed, attempt %d/%d: %s", name, attempt, DOWNLOAD_ATTEMPTS, problem)
+        if attempt < DOWNLOAD_ATTEMPTS:
+            time.sleep(2 * attempt)
+    raise UserError(
+        f"Lark did not return the file after {DOWNLOAD_ATTEMPTS} tries ({problem}). Please @ me on it again in a minute."
+    )
 
 
 def format_report(report: dict, name: str) -> str:
@@ -109,23 +141,37 @@ def format_report(report: dict, name: str) -> str:
 
 
 def handle(message) -> None:
+    target, prefix = message.message_id, ""
     try:
         audio = find_audio(message)
         if audio is None:
-            reply(message.message_id, USAGE)
+            reply(target, USAGE)
             return
         source_id, message_type, content = audio
         # Voice messages carry no file name; Lark records them as Opus.
         name = Path(content.get("file_name") or f"voice-message.{'opus' if message_type == 'audio' else 'bin'}").name
-        reply(message.message_id, f"Got {name}. Checking, this usually takes under a minute.")
+        # Answer on the file's own message and lead with its name, so each
+        # result can be matched to its file when several are checked at once.
+        target, prefix = source_id, f"File: {name}\n"
         with tempfile.TemporaryDirectory() as folder:
             path = download(source_id, content["file_key"], name, Path(folder))
+            reply(target, f"{prefix}Checking. This usually takes under a minute.")
             report = detect_ai.detect(path, active, DETECT_ARGS, escalate=True)
+        for provider, r in report["providers"].items():
+            if r["label"] == "unknown":
+                log.warning("%s: %s gave no verdict: %s", name, provider, r["detail"])
         log.info("%s -> %s", name, report["verdict"])
-        reply(message.message_id, format_report(report, name))
+        reply(target, format_report(report, name))
+    except UserError as e:
+        log.warning("message %s: %s", message.message_id, e)
+        reply(target, f"{prefix}Check failed: {e}")
     except Exception as e:
         log.exception("handling message %s failed", message.message_id)
-        reply(message.message_id, f"Check failed: {e}")
+        reply(
+            target,
+            f"{prefix}Check failed: unexpected error ({type(e).__name__}: {e}). "
+            "Please try again; if it keeps failing, tell the bot's maintainer.",
+        )
 
 
 def on_message(data: P2ImMessageReceiveV1) -> None:
