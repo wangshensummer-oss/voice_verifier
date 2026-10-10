@@ -64,6 +64,7 @@ USAGE = (
     f"I write the results into its '{lark_sheet.CONCLUSION}' column."
 )
 DOWNLOAD_ATTEMPTS = 3
+DOWNLOAD_CHUNK = 8 * 1024 * 1024
 # Rows checked per batch request; sending the link again continues with the rest.
 BATCH_ROWS = 200
 DETECT_ARGS = argparse.Namespace(zero_retention=False, timeout=180)
@@ -111,8 +112,8 @@ def find_audio(message) -> tuple[str, str, dict] | None:
     return parent.message_id, parent.msg_type, json.loads(parent.body.content)
 
 
-def fetch(name: str, send, folder: Path, if_refused: str) -> Path:
-    """Download one file from Lark into folder, retrying transient failures. send() performs the request."""
+def fetch(name: str, send, if_refused: str):
+    """Run one Lark download request, retrying transient failures, and return its response."""
     problem = ""
     for attempt in range(1, DOWNLOAD_ATTEMPTS + 1):
         try:
@@ -121,9 +122,7 @@ def fetch(name: str, send, folder: Path, if_refused: str) -> Path:
             problem = f"network error, {type(e).__name__}"
         else:
             if response.success():
-                path = folder / name
-                path.write_bytes(response.file.read())
-                return path
+                return response
             if response.code is not None:
                 # Lark answered with its own error; asking again will not change it.
                 raise UserError(f"Lark refused the download ({response.code}: {response.msg}). {if_refused}")
@@ -138,17 +137,31 @@ def fetch(name: str, send, folder: Path, if_refused: str) -> Path:
 
 def download(message_id: str, file_key: str, name: str, folder: Path) -> Path:
     request = GetMessageResourceRequest.builder().message_id(message_id).file_key(file_key).type("file").build()
-    return fetch(
+    response = fetch(
         name,
         lambda: client.im.v1.message_resource.get(request),
-        folder,
         "Download the recording and resend it to me as a file.",
     )
+    path = folder / name
+    path.write_bytes(response.file.read())
+    return path
 
 
 def download_attachment(file_token: str, name: str, folder: Path) -> Path:
+    """Download a sheet attachment in ranges; Lark drops single responses larger than 16 MB."""
     request = DownloadMediaRequest.builder().file_token(file_token).build()
-    return fetch(name, lambda: client.drive.v1.media.download(request), folder, lark_sheet.SHARE_HINT)
+    path, start = folder / name, 0
+    with path.open("wb") as out:
+        while True:
+            option = lark.RequestOption.builder().headers({"Range": f"bytes={start}-{start + DOWNLOAD_CHUNK - 1}"}).build()
+            response = fetch(name, lambda: client.drive.v1.media.download(request, option), lark_sheet.SHARE_HINT)
+            data = response.file.read()
+            out.write(data)
+            start += len(data)
+            headers = {key.lower(): value for key, value in response.raw.headers.items()}
+            total = headers.get("content-range", "").rpartition("/")[2]
+            if not data or not total.isdigit() or start >= int(total):
+                return path
 
 
 def format_report(report: dict, name: str) -> str:
