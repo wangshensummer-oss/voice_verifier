@@ -1,7 +1,8 @@
 """Batch checking: find the recordings in a Lark Sheet and write verdicts back to it.
 
-The sheet needs a header row with a "voice" column holding one audio
-attachment per row. Verdicts go into the "conclusion" column, which is added
+The sheet needs a header row and a "voice" column holding one audio
+attachment per row; if no column has that name, the only column containing
+attachments is used. Verdicts go into the "conclusion" column, which is added
 after the last header if the sheet has none.
 """
 from __future__ import annotations
@@ -132,9 +133,16 @@ def plan(client: lark.Client, kind: str, token: str, sheet_id: str | None) -> Jo
         raise UserError("That sheet is empty.")
 
     header = [cell_text(cell).strip().lower() for cell in values[0]]
-    if VOICE not in header:
-        raise UserError(f"The sheet '{sheet.title}' has no '{VOICE}' column. Name the column with the recordings '{VOICE}'.")
-    voice = header.index(VOICE)
+    if VOICE in header:
+        voice = header.index(VOICE)
+    else:
+        # Without a column of that name, a single column of attachments is unambiguous.
+        holding = {i for row in values[1:] for i, cell in enumerate(row) if attachments(cell)}
+        if len(holding) != 1:
+            raise UserError(
+                f"The sheet '{sheet.title}' has no '{VOICE}' column. Name the column with the recordings '{VOICE}'."
+            )
+        voice = holding.pop()
     if CONCLUSION in header:
         conclusion = header.index(CONCLUSION)
     else:
