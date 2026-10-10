@@ -63,6 +63,7 @@ USAGE = (
     "To check many, send me a link to a Lark Sheet with an 'Attachment' column of audio attachments; "
     f"I write the results into its '{lark_sheet.CONCLUSION}' and '{lark_sheet.DETAILS}' columns."
 )
+UNEXPECTED = "Something went wrong on my side. Please try again; if it keeps failing, tell the bot's maintainer."
 DOWNLOAD_ATTEMPTS = 3
 DOWNLOAD_CHUNK = 8 * 1024 * 1024
 # Rows checked per batch request; sending the link again continues with the rest.
@@ -119,7 +120,8 @@ def fetch(name: str, send, if_refused: str):
         try:
             response = send()
         except requests.RequestException as e:
-            problem = f"network error, {type(e).__name__}"
+            problem = "the connection to Lark dropped"
+            log.warning("download of %s: %r", name, e)
         else:
             if response.success():
                 return response
@@ -128,7 +130,8 @@ def fetch(name: str, send, if_refused: str):
                 raise UserError(f"Lark refused the download ({response.code}: {response.msg}). {if_refused}")
             # Lark's gateway times out now and then (HTTP 504 with an empty body) when
             # several downloads run at once; the same request succeeds moments later.
-            problem = f"HTTP {response.raw.status_code} from Lark"
+            status = response.raw.status_code
+            problem = "Lark timed out" if status == 504 else f"Lark returned error {status}"
         log.warning("download of %s failed, attempt %d/%d: %s", name, attempt, DOWNLOAD_ATTEMPTS, problem)
         if attempt < DOWNLOAD_ATTEMPTS:
             time.sleep(2 * attempt)
@@ -164,16 +167,45 @@ def download_attachment(file_token: str, name: str, folder: Path) -> Path:
                 return path
 
 
+def percent(score: float) -> str:
+    if score < 0.01:
+        return "under 1%"
+    if score > 0.99:
+        return "over 99%"
+    return f"{round(score * 100)}%"
+
+
+def explain(report: dict) -> list[str]:
+    """The lines under a verdict: one likelihood figure per check that ran, and why a review is needed.
+
+    The same wording is used for every result. Detector names, raw metrics and
+    error text stay in the log.
+    """
+    results = list(report["providers"].values())
+    scores = [r["score"] for r in results if r["label"] != "unknown" and r["score"] is not None]
+    order = ("first check", "second check", "third check")
+    lines = []
+    if len(scores) == 1:
+        lines.append(f"AI likelihood: {percent(scores[0])}")
+    elif scores:
+        lines.append("AI likelihood: " + ", ".join(f"{percent(s)} ({order[i]})" for i, s in enumerate(scores)))
+    if report["verdict"] == "REVIEW":
+        labels = {r["label"] for r in results}
+        if {"fake", "real"} <= labels:
+            lines.append("The checks disagree, so please listen to it yourself.")
+        elif "partial" in labels:
+            lines.append("Part of the recording looks AI-generated, so please listen to it yourself.")
+        else:
+            lines.append("The check could not be completed. Please try again in a few minutes.")
+    return lines
+
+
 def format_report(report: dict, name: str) -> str:
-    lines = [f"File: {name}", f"Voice AI or Real: {VERDICT_TEXT[report['verdict']]}"]
-    several = len(report["providers"]) > 1
-    for provider, r in report["providers"].items():
-        if several:
-            lines.append(f"[{provider}] {r['label']}")
-        if r["label"] == "unknown":
-            lines.append(f"Detail: {r['detail']}")
-        lines.extend(f"{key}: {value}" for key, value in r["fields"].items() if value is not None)
-    return "\n".join(lines)
+    return "\n".join([f"File: {name}", f"Voice AI or Real: {VERDICT_TEXT[report['verdict']]}"] + explain(report))
+
+
+def log_report(name: str, report: dict) -> None:
+    log.info("%s -> %s %s", name, report["verdict"], json.dumps(report["providers"], ensure_ascii=False))
 
 
 def display_name(message_type: str, content: dict, name: str) -> str:
@@ -190,17 +222,6 @@ def display_name(message_type: str, content: dict, name: str) -> str:
     return f"{kind} ({seconds // 60}:{seconds % 60:02d})"
 
 
-def describe(report: dict) -> str:
-    """One line per detector with its label and metrics, for the sheet's details column."""
-    parts = []
-    for provider, r in report["providers"].items():
-        metrics = [f"{key} {value}" for key, value in r["fields"].items() if value is not None]
-        if r["label"] == "unknown" and r["detail"]:
-            metrics.append(r["detail"])
-        parts.append(", ".join([f"{provider}: {r['label']}"] + metrics))
-    return "\n".join(parts)
-
-
 def check_row(row: lark_sheet.Row) -> tuple[str, str]:
     """Run detection for one sheet row and return its conclusion and details cells."""
     if row.file_token is None:
@@ -213,11 +234,9 @@ def check_row(row: lark_sheet.Row) -> tuple[str, str]:
         return lark_sheet.FAILED, str(e)
     except Exception as e:
         log.exception("row %d (%s) failed", row.number, row.name)
-        return lark_sheet.FAILED, f"{type(e).__name__}: {e}"
-    for provider, r in report["providers"].items():
-        if r["label"] == "unknown":
-            log.warning("row %d (%s): %s gave no verdict: %s", row.number, row.name, provider, r["detail"])
-    return VERDICT_TEXT[report["verdict"]], describe(report)
+        return lark_sheet.FAILED, UNEXPECTED
+    log_report(f"row {row.number} ({row.name})", report)
+    return VERDICT_TEXT[report["verdict"]], "\n".join(explain(report))
 
 
 def handle_batch(message, kind: str, token: str, sheet_id: str | None) -> None:
@@ -278,21 +297,14 @@ def handle(message) -> None:
             path = download(source_id, content["file_key"], name, Path(folder))
             reply(target, f"{prefix}Checking. This usually takes under a minute.")
             report = detect_ai.detect(path, active, DETECT_ARGS, escalate=True)
-        for provider, r in report["providers"].items():
-            if r["label"] == "unknown":
-                log.warning("%s: %s gave no verdict: %s", name, provider, r["detail"])
-        log.info("%s -> %s", name, report["verdict"])
+        log_report(name, report)
         reply(target, format_report(report, label))
     except UserError as e:
         log.warning("message %s: %s", message.message_id, e)
         reply(target, f"{prefix}Check failed: {e}")
-    except Exception as e:
+    except Exception:
         log.exception("handling message %s failed", message.message_id)
-        reply(
-            target,
-            f"{prefix}Check failed: unexpected error ({type(e).__name__}: {e}). "
-            "Please try again; if it keeps failing, tell the bot's maintainer.",
-        )
+        reply(target, f"{prefix}Check failed: {UNEXPECTED}")
 
 
 def on_message(data: P2ImMessageReceiveV1) -> None:

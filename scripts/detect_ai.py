@@ -134,12 +134,16 @@ def resemble(path: Path, args: argparse.Namespace) -> dict:
         return result("unknown", detail=f"status {item['status']}")
 
     metrics = item["metrics"]
-    # Resemble documents the label but not the direction of aggregated_score,
-    # so the verdict uses the label and the score is reported as-is.
+    # The verdict comes from Resemble's own label, not from a threshold on its score.
     detail = f"aggregated_score {metrics.get('aggregated_score')}, consistency {metrics.get('consistency')}"
     label = metrics["label"] if metrics["label"] in ("fake", "real") else "unknown"
     fields = {"Aggregated_score": metrics.get("aggregated_score"), "Consistency": metrics.get("consistency")}
-    return result(label, detail=detail, fields=fields)
+    # Undocumented, but observed to run from 0 (real) to 1 (fake).
+    try:
+        score = float(metrics.get("aggregated_score"))
+    except (TypeError, ValueError):
+        score = None
+    return result(label, score, detail, fields)
 
 
 def reality_defender(path: Path, args: argparse.Namespace) -> dict:
