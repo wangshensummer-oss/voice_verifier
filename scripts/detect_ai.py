@@ -23,6 +23,11 @@ RESEMBLE_URL = "https://app.resemble.ai/api/v2/detect"
 # synthetic is probably spliced, so it goes to review instead of passing.
 PARTIAL_PEAK = 0.8
 
+# Connect directly unless --proxy is given: an ambient proxy (macOS system
+# setting or HTTPS_PROXY) that cannot reach a detector would fail every call.
+http = requests.Session()
+http.trust_env = False
+
 
 def load_env() -> None:
     for env_file in (Path.cwd() / ".env", Path(__file__).resolve().parent.parent / ".env"):
@@ -41,15 +46,27 @@ def result(label: str, score: float | None = None, detail: str = "") -> dict:
     return {"label": label, "score": score, "detail": detail}
 
 
+def check(r: requests.Response) -> None:
+    """Raise with the provider's own error message, which says more than the status code."""
+    if r.ok:
+        return
+    try:
+        body = r.json()
+        message = body.get("message") or body.get("error") or body.get("detail") or r.text
+    except ValueError:
+        message = r.text
+    raise RuntimeError(f"HTTP {r.status_code}: {str(message)[:200]}")
+
+
 def modulate(path: Path, args: argparse.Namespace) -> dict:
     with path.open("rb") as f:
-        r = requests.post(
+        r = http.post(
             MODULATE_URL,
             headers={"X-API-Key": os.environ["MODULATE_API_KEY"]},
             files={"upload_file": (path.name, f)},
             timeout=300,
         )
-    r.raise_for_status()
+    check(r)
     frames = [f for f in r.json()["frames"] if f["verdict"] != "no-content"]
     if not frames:
         return result("unknown", detail="no speech found")
@@ -74,8 +91,8 @@ def resemble(path: Path, args: argparse.Namespace) -> dict:
     headers = {"Authorization": f"Bearer {os.environ['RESEMBLE_API_KEY']}"}
     data = {"zero_retention_mode": "true"} if args.zero_retention else {}
     with path.open("rb") as f:
-        r = requests.post(RESEMBLE_URL, headers=headers, files={"file": (path.name, f)}, data=data, timeout=300)
-    r.raise_for_status()
+        r = http.post(RESEMBLE_URL, headers=headers, files={"file": (path.name, f)}, data=data, timeout=300)
+    check(r)
     item = r.json()["item"]
 
     deadline = time.time() + args.timeout
@@ -83,8 +100,8 @@ def resemble(path: Path, args: argparse.Namespace) -> dict:
         if time.time() > deadline:
             return result("unknown", detail=f"still processing after {args.timeout}s (uuid {item['uuid']})")
         time.sleep(3)
-        r = requests.get(f"{RESEMBLE_URL}/{item['uuid']}", headers=headers, timeout=60)
-        r.raise_for_status()
+        r = http.get(f"{RESEMBLE_URL}/{item['uuid']}", headers=headers, timeout=60)
+        check(r)
         item = r.json()["item"]
     if item["status"] != "completed":
         return result("unknown", detail=f"status {item['status']}")
@@ -136,10 +153,13 @@ def main() -> int:
     parser.add_argument("--providers", help="comma-separated subset of: " + ",".join(PROVIDERS))
     parser.add_argument("--zero-retention", action="store_true", help="ask providers that support it to delete the audio after analysis")
     parser.add_argument("--timeout", type=int, default=180, help="seconds to wait for async providers")
+    parser.add_argument("--proxy", help="proxy URL to use for detector requests (default: connect directly)")
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
 
     load_env()
+    if args.proxy:
+        http.proxies = {"http": args.proxy, "https": args.proxy}
     wanted = args.providers.split(",") if args.providers else list(PROVIDERS)
     unknown = [name for name in wanted if name not in PROVIDERS]
     if unknown:
