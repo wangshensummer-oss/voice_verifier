@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """Lark bot that runs AI-speech detection on audio files sent to it.
 
-  Direct chat: send the bot an audio file.
-  Group chat:  reply to the audio file's message and @ the bot.
+  Single check, direct chat: send the bot an audio file.
+  Single check, group chat:  reply to the audio file's message and @ the bot.
+  Batch check: send the bot (in a group, @ it with) a link to a Lark Sheet that
+               has a "voice" column of audio attachments; verdicts are written
+               to its "conclusion" column. See lark_sheet.py.
 
 Connects out to Lark over a long connection, so no public URL is needed.
 Needs LARK_APP_ID and LARK_APP_SECRET in the environment / .env, plus at least
@@ -19,7 +22,9 @@ import logging
 import os
 import sys
 import tempfile
+import threading
 import time
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -32,6 +37,7 @@ os.environ["NO_PROXY"] = os.environ["no_proxy"] = "*"
 
 import lark_oapi as lark
 import requests
+from lark_oapi.api.drive.v1 import DownloadMediaRequest
 from lark_oapi.api.im.v1 import (
     GetMessageRequest,
     GetMessageResourceRequest,
@@ -39,6 +45,9 @@ from lark_oapi.api.im.v1 import (
     ReplyMessageRequest,
     ReplyMessageRequestBody,
 )
+
+import lark_sheet
+from lark_sheet import UserError
 
 log = logging.getLogger("lark_bot")
 
@@ -49,14 +58,22 @@ VERDICT_TEXT = {
     "PASS": "Real",
     "PASS (single detector)": "Real",
 }
-USAGE = "Send me one audio file directly. In a group, reply to that file's message and @ me. One file per request."
+USAGE = (
+    "To check one recording, send me the audio file directly; in a group, reply to that file's message and @ me.\n"
+    f"To check many, send me a link to a Lark Sheet with a '{lark_sheet.VOICE}' column of audio attachments; "
+    f"I write the results into its '{lark_sheet.CONCLUSION}' column."
+)
 DOWNLOAD_ATTEMPTS = 3
+# Rows checked per batch request; sending the link again continues with the rest.
+BATCH_ROWS = 200
 DETECT_ARGS = argparse.Namespace(zero_retention=False, timeout=180)
 
 client: lark.Client
 active: list[str]
-workers = ThreadPoolExecutor(max_workers=2)
+workers = ThreadPoolExecutor(max_workers=4)
 seen: set[str] = set()  # Lark re-delivers events it thinks were missed
+batches_running: set[str] = set()  # spreadsheet tokens, so one sheet is not checked twice at once
+batches_lock = threading.Lock()
 
 
 def reply(message_id: str, text: str) -> None:
@@ -71,10 +88,6 @@ def reply(message_id: str, text: str) -> None:
     response = client.im.v1.message.reply(request)
     if not response.success():
         log.error("reply failed: %s %s", response.code, response.msg)
-
-
-class UserError(Exception):
-    """A failure whose message says what went wrong and what to do, safe to show in the chat."""
 
 
 def find_audio(message) -> tuple[str, str, dict] | None:
@@ -98,12 +111,12 @@ def find_audio(message) -> tuple[str, str, dict] | None:
     return parent.message_id, parent.msg_type, json.loads(parent.body.content)
 
 
-def download(message_id: str, file_key: str, name: str, folder: Path) -> Path:
-    request = GetMessageResourceRequest.builder().message_id(message_id).file_key(file_key).type("file").build()
+def fetch(name: str, send, folder: Path, if_refused: str) -> Path:
+    """Download one file from Lark into folder, retrying transient failures. send() performs the request."""
     problem = ""
     for attempt in range(1, DOWNLOAD_ATTEMPTS + 1):
         try:
-            response = client.im.v1.message_resource.get(request)
+            response = send()
         except requests.RequestException as e:
             problem = f"network error, {type(e).__name__}"
         else:
@@ -113,19 +126,29 @@ def download(message_id: str, file_key: str, name: str, folder: Path) -> Path:
                 return path
             if response.code is not None:
                 # Lark answered with its own error; asking again will not change it.
-                raise UserError(
-                    f"Lark refused the download ({response.code}: {response.msg}). "
-                    "Download the recording and resend it to me as a file."
-                )
+                raise UserError(f"Lark refused the download ({response.code}: {response.msg}). {if_refused}")
             # Lark's gateway times out now and then (HTTP 504 with an empty body) when
             # several downloads run at once; the same request succeeds moments later.
             problem = f"HTTP {response.raw.status_code} from Lark"
         log.warning("download of %s failed, attempt %d/%d: %s", name, attempt, DOWNLOAD_ATTEMPTS, problem)
         if attempt < DOWNLOAD_ATTEMPTS:
             time.sleep(2 * attempt)
-    raise UserError(
-        f"Lark did not return the file after {DOWNLOAD_ATTEMPTS} tries ({problem}). Please @ me on it again in a minute."
+    raise UserError(f"Lark did not return the file after {DOWNLOAD_ATTEMPTS} tries ({problem}). Please try again in a minute.")
+
+
+def download(message_id: str, file_key: str, name: str, folder: Path) -> Path:
+    request = GetMessageResourceRequest.builder().message_id(message_id).file_key(file_key).type("file").build()
+    return fetch(
+        name,
+        lambda: client.im.v1.message_resource.get(request),
+        folder,
+        "Download the recording and resend it to me as a file.",
     )
+
+
+def download_attachment(file_token: str, name: str, folder: Path) -> Path:
+    request = DownloadMediaRequest.builder().file_token(file_token).build()
+    return fetch(name, lambda: client.drive.v1.media.download(request), folder, lark_sheet.SHARE_HINT)
 
 
 def format_report(report: dict, name: str) -> str:
@@ -154,9 +177,67 @@ def display_name(message_type: str, content: dict, name: str) -> str:
     return f"{kind} ({seconds // 60}:{seconds % 60:02d})"
 
 
+def check_row(row: lark_sheet.Row) -> str:
+    """Run detection for one sheet row and return the text for its conclusion cell."""
+    if row.file_token is None:
+        return f"{lark_sheet.FAILED_PREFIX} no audio attachment in the '{lark_sheet.VOICE}' cell"
+    try:
+        with tempfile.TemporaryDirectory() as folder:
+            path = download_attachment(row.file_token, Path(row.name).name, Path(folder))
+            report = detect_ai.detect(path, active, DETECT_ARGS, escalate=True)
+    except UserError as e:
+        return f"{lark_sheet.FAILED_PREFIX} {e}"
+    except Exception as e:
+        log.exception("row %d (%s) failed", row.number, row.name)
+        return f"{lark_sheet.FAILED_PREFIX} {type(e).__name__}: {e}"
+    for provider, r in report["providers"].items():
+        if r["label"] == "unknown":
+            log.warning("row %d (%s): %s gave no verdict: %s", row.number, row.name, provider, r["detail"])
+    return VERDICT_TEXT[report["verdict"]]
+
+
+def handle_batch(message, kind: str, token: str, sheet_id: str | None) -> None:
+    target = message.message_id
+    job = lark_sheet.plan(client, kind, token, sheet_id)
+    prefix = f"Sheet: {job.title}\n"
+    with batches_lock:
+        if job.token in batches_running:
+            reply(target, f"{prefix}I am already checking this sheet. Results appear in the '{lark_sheet.CONCLUSION}' column.")
+            return
+        batches_running.add(job.token)
+    try:
+        rows, later = job.rows[:BATCH_ROWS], len(job.rows[BATCH_ROWS:])
+        skipped = f" {job.already_done} row(s) already have a conclusion and are skipped." if job.already_done else ""
+        if not rows:
+            reply(target, f"{prefix}Nothing to check.{skipped or f' No row has a recording in the {lark_sheet.VOICE!r} column.'}")
+            return
+        reply(
+            target,
+            f"{prefix}Checking {len(rows)} recording(s). Each result is written to the "
+            f"'{lark_sheet.CONCLUSION}' column as it finishes.{skipped}",
+        )
+        counts: Counter = Counter()
+        for row in rows:
+            text = check_row(row)
+            lark_sheet.write(client, job, row.number, text)
+            counts["Failed" if text.startswith(lark_sheet.FAILED_PREFIX) else text] += 1
+        log.info("sheet %s: %s", job.title, dict(counts))
+        summary = ", ".join(f"{label} {counts[label]}" for label in ("Real", "AI", "Needs review", "Failed") if counts[label])
+        more = f"\n{later} more row(s) are waiting; send me the link again to continue." if later else ""
+        retry = "\nSend me the link again to retry the failed rows." if counts["Failed"] else ""
+        reply(target, f"{prefix}Done, {len(rows)} checked: {summary}.{retry}{more}")
+    finally:
+        with batches_lock:
+            batches_running.discard(job.token)
+
+
 def handle(message) -> None:
     target, prefix = message.message_id, ""
     try:
+        link = lark_sheet.find_link(message.content) if message.message_type in ("text", "post") else None
+        if link:
+            handle_batch(message, *link)
+            return
         audio = find_audio(message)
         if audio is None:
             reply(target, USAGE)
