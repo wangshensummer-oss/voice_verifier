@@ -1,0 +1,11 @@
+.env
+.venv/
+__pycache__/
+# biometric data and candidate recordings never go into git
+voiceprints/
+*.npy
+*.wav
+*.mp3
+*.m4a
+*.flac
+*.ogg
