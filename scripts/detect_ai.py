@@ -41,9 +41,12 @@ def load_env() -> None:
             os.environ.setdefault(key.strip(), value.strip().strip("'\""))
 
 
-def result(label: str, score: float | None = None, detail: str = "") -> dict:
-    """label is one of: fake, real, partial, unknown. score is P(fake) when the provider defines one."""
-    return {"label": label, "score": score, "detail": detail}
+def result(label: str, score: float | None = None, detail: str = "", fields: dict | None = None) -> dict:
+    """label is one of: fake, real, partial, unknown. score is P(fake) when the provider defines one.
+
+    fields holds the provider's own metrics by display name, for callers that format their own report.
+    """
+    return {"label": label, "score": score, "detail": detail, "fields": fields or {}}
 
 
 def check(r: requests.Response) -> None:
@@ -80,11 +83,12 @@ def modulate(path: Path, args: argparse.Namespace) -> dict:
         peak = max(peak, p_fake)
     score = weighted / total
     detail = f"{len(frames)} frames, peak {peak:.2f}"
+    fields = {"AI_probability": round(score, 4), "Peak_frame": round(peak, 4)}
     if score >= 0.5:
-        return result("fake", score, detail)
+        return result("fake", score, detail, fields)
     if peak >= PARTIAL_PEAK:
-        return result("partial", score, detail)
-    return result("real", score, detail)
+        return result("partial", score, detail, fields)
+    return result("real", score, detail, fields)
 
 
 def resemble(path: Path, args: argparse.Namespace) -> dict:
@@ -111,7 +115,8 @@ def resemble(path: Path, args: argparse.Namespace) -> dict:
     # so the verdict uses the label and the score is reported as-is.
     detail = f"aggregated_score {metrics.get('aggregated_score')}, consistency {metrics.get('consistency')}"
     label = metrics["label"] if metrics["label"] in ("fake", "real") else "unknown"
-    return result(label, detail=detail)
+    fields = {"Aggregated_score": metrics.get("aggregated_score"), "Consistency": metrics.get("consistency")}
+    return result(label, detail=detail, fields=fields)
 
 
 def reality_defender(path: Path, args: argparse.Namespace) -> dict:
@@ -128,7 +133,7 @@ def reality_defender(path: Path, args: argparse.Namespace) -> dict:
     res = asyncio.run(run())
     status = str(res.get("status", "")).upper()
     label = {"MANIPULATED": "fake", "FAKE": "fake", "AUTHENTIC": "real"}.get(status, "unknown")
-    return result(label, res.get("score"), f"status {status}")
+    return result(label, res.get("score"), f"status {status}", {"Score": res.get("score")})
 
 
 PROVIDERS = {

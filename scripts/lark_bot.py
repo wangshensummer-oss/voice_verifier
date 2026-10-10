@@ -7,6 +7,9 @@
 Connects out to Lark over a long connection, so no public URL is needed.
 Needs LARK_APP_ID and LARK_APP_SECRET in the environment / .env, plus at least
 one detector key (see detect_ai.py). Set LARK_DOMAIN=feishu for Feishu tenants.
+
+  lark_bot.py --setup   create the Lark app by approving a link, and save its
+                        credentials to .env
 """
 from __future__ import annotations
 
@@ -39,12 +42,12 @@ log = logging.getLogger("lark_bot")
 
 AUDIO_MESSAGE_TYPES = {"file", "audio", "media"}
 VERDICT_TEXT = {
-    "FLAG": "疑似 AI 合成",
-    "REVIEW": "需要人工复核",
-    "PASS": "未发现 AI 合成迹象",
-    "PASS (single detector)": "未发现 AI 合成迹象（仅一家检测器）",
+    "FLAG": "AI",
+    "REVIEW": "Needs review",
+    "PASS": "Real",
+    "PASS (single detector)": "Real",
 }
-USAGE = "请直接把音频文件发给我；在群里请回复那条音频文件消息并 @我。"
+USAGE = "Send me an audio file directly. In a group, reply to the audio file's message and @ me."
 DETECT_ARGS = argparse.Namespace(zero_retention=False, timeout=180)
 
 client: lark.Client
@@ -87,18 +90,21 @@ def download(message_id: str, file_key: str, name: str, folder: Path) -> Path:
     request = GetMessageResourceRequest.builder().message_id(message_id).file_key(file_key).type("file").build()
     response = client.im.v1.message_resource.get(request)
     if not response.success():
-        raise RuntimeError(f"下载文件失败：{response.code} {response.msg}")
+        raise RuntimeError(f"could not download the file: {response.code} {response.msg}")
     path = folder / name
     path.write_bytes(response.file.read())
     return path
 
 
 def format_report(report: dict, name: str) -> str:
-    lines = [f"检测结论：{VERDICT_TEXT[report['verdict']]}", f"文件：{name}"]
+    lines = [f"File: {name}", f"Voice AI or Real: {VERDICT_TEXT[report['verdict']]}"]
+    several = len(report["providers"]) > 1
     for provider, r in report["providers"].items():
-        score = "" if r["score"] is None else f"，AI 概率 {r['score']:.2f}"
-        lines.append(f"· {provider}：{r['label']}{score}（{r['detail']}）")
-    lines.append("以上是复核信号，不是定论。")
+        if several:
+            lines.append(f"[{provider}] {r['label']}")
+        if r["label"] == "unknown":
+            lines.append(f"Detail: {r['detail']}")
+        lines.extend(f"{key}: {value}" for key, value in r["fields"].items() if value is not None)
     return "\n".join(lines)
 
 
@@ -111,7 +117,7 @@ def handle(message) -> None:
         source_id, message_type, content = audio
         # Voice messages carry no file name; Lark records them as Opus.
         name = Path(content.get("file_name") or f"voice-message.{'opus' if message_type == 'audio' else 'bin'}").name
-        reply(message.message_id, f"收到 {name}，检测中，通常需要不到一分钟。")
+        reply(message.message_id, f"Got {name}. Checking, this usually takes under a minute.")
         with tempfile.TemporaryDirectory() as folder:
             path = download(source_id, content["file_key"], name, Path(folder))
             report = detect_ai.detect(path, active, DETECT_ARGS)
@@ -119,7 +125,7 @@ def handle(message) -> None:
         reply(message.message_id, format_report(report, name))
     except Exception as e:
         log.exception("handling message %s failed", message.message_id)
-        reply(message.message_id, f"检测失败：{e}")
+        reply(message.message_id, f"Check failed: {e}")
 
 
 def on_message(data: P2ImMessageReceiveV1) -> None:
@@ -135,8 +141,39 @@ def on_message(data: P2ImMessageReceiveV1) -> None:
     workers.submit(handle, message)
 
 
+def save_env(values: dict[str, str]) -> Path:
+    env_file = Path(__file__).resolve().parent.parent / ".env"
+    lines = env_file.read_text().splitlines() if env_file.exists() else []
+    lines = [line for line in lines if line.split("=", 1)[0].strip() not in values]
+    env_file.write_text("\n".join(lines + [f"{k}={v}" for k, v in values.items()]) + "\n")
+    return env_file
+
+
+def setup() -> int:
+    """Create the app through Lark's one-click registration; the user approves it in Lark."""
+    feishu = os.environ.get("LARK_DOMAIN", "lark").lower() == "feishu"
+    accounts = lark.FEISHU_OAUTH_DOMAIN if feishu else lark.LARK_OAUTH_DOMAIN
+
+    def show_link(info: dict) -> None:
+        print(f"Open this link in Lark and approve it (valid {info['expire_in'] // 60} min):\n{info['url']}", flush=True)
+
+    result = lark.register_app(
+        on_qr_code=show_link,
+        domain=accounts,
+        lark_domain=lark.LARK_OAUTH_DOMAIN,
+        app_preset={"name": "Voice Verifier", "desc": "Checks whether a voice recording is AI-generated"},
+    )
+    env_file = save_env({"LARK_APP_ID": result["client_id"], "LARK_APP_SECRET": result["client_secret"]})
+    print(f"App {result['client_id']} created; credentials saved to {env_file}")
+    return 0
+
+
 def main() -> int:
     global client, active
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--setup", action="store_true", help="create the Lark app and save its credentials to .env")
+    if parser.parse_args().setup:
+        return setup()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     app_id, app_secret = os.environ.get("LARK_APP_ID"), os.environ.get("LARK_APP_SECRET")
     if not app_id or not app_secret:
