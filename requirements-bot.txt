@@ -1,0 +1,3 @@
+# Minimal dependencies for scripts/lark_bot.py (no local speaker matching).
+requests
+lark-oapi
