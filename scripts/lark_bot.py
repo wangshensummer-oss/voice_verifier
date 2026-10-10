@@ -3,6 +3,7 @@
 
   Single check, direct chat: send the bot an audio file.
   Single check, group chat:  reply to the audio file's message and @ the bot.
+  Single check by link: send the bot a Google Drive link to the recording.
   Batch check: send the bot (in a group, @ it with) a link to a Lark Sheet that
                has an "Attachment" column of audio attachments; the same result
                fields are written into the sheet. See lark_sheet.py.
@@ -47,6 +48,7 @@ from lark_oapi.api.im.v1 import (
 )
 
 import lark_sheet
+import link_fetch
 from lark_sheet import UserError
 
 log = logging.getLogger("lark_bot")
@@ -59,7 +61,8 @@ VERDICT_TEXT = {
     "PASS (single detector)": "Real",
 }
 USAGE = (
-    "To check one recording, send me the audio file directly; in a group, reply to that file's message and @ me.\n"
+    "To check one recording, send me the audio file or a Google Drive link to it; "
+    "in a group, reply to the file's message and @ me.\n"
     "To check many, send me a link to a Lark Sheet with an 'Attachment' column of audio attachments; "
     "I write the same result into the sheet, one row per recording."
 )
@@ -256,11 +259,15 @@ def display_name(message_type: str, content: dict, name: str) -> str:
 
 def check_row(row: lark_sheet.Row) -> list[str]:
     """Run detection for one sheet row and return its lark_sheet.OUTPUTS cells."""
-    if row.file_token is None:
-        return [lark_sheet.FAILED, "", "No audio attachment in the 'Attachment' cell."]
+    drive_id = link_fetch.find(row.name) if row.file_token is None else None
+    if row.file_token is None and drive_id is None:
+        return [lark_sheet.FAILED, "", "No audio attachment or Google Drive link in the 'Attachment' cell."]
     try:
         with tempfile.TemporaryDirectory() as folder:
-            path = download_attachment(row.file_token, Path(row.name).name, Path(folder))
+            if drive_id:
+                path = link_fetch.download(drive_id, Path(folder))
+            else:
+                path = download_attachment(row.file_token, Path(row.name).name, Path(folder))
             report = detect_ai.detect(path, active, DETECT_ARGS, escalate=True)
     except UserError as e:
         return [lark_sheet.FAILED, "", str(e)]
@@ -310,26 +317,35 @@ def handle_batch(message, kind: str, token: str, sheet_id: str | None) -> None:
 def handle(message) -> None:
     target, prefix = message.message_id, ""
     try:
-        link = lark_sheet.find_link(message.content) if message.message_type in ("text", "post") else None
-        if link:
-            handle_batch(message, *link)
+        text = lark_sheet.message_text(message.content) if message.message_type in ("text", "post") else ""
+        sheet = lark_sheet.find_link(text)
+        if sheet:
+            handle_batch(message, *sheet)
             return
-        audio = find_audio(message)
-        if audio is None:
-            reply(target, USAGE)
-            return
-        source_id, message_type, content = audio
-        # Voice messages carry no file name; Lark records them as Opus.
-        name = Path(content.get("file_name") or f"voice-message.{'opus' if message_type == 'audio' else 'bin'}").name
-        # Answer on the file's own message and lead with its name, so each
-        # result can be matched to its file when several are checked at once.
-        label = display_name(message_type, content, name)
-        target, prefix = source_id, f"File: {label}\n"
+        drive_id = link_fetch.find(text)
+        if drive_id:
+            # The file's name is only known once Google has answered.
+            label, fetch = None, lambda folder: link_fetch.download(drive_id, folder)
+        else:
+            audio = find_audio(message)
+            if audio is None:
+                reply(target, f"I can't open that link. {link_fetch.SUPPORTED}" if link_fetch.has_other_link(text) else USAGE)
+                return
+            source_id, message_type, content = audio
+            # Voice messages carry no file name; Lark records them as Opus.
+            name = Path(content.get("file_name") or f"voice-message.{'opus' if message_type == 'audio' else 'bin'}").name
+            # Answer on the file's own message and lead with its name, so each
+            # result can be matched to its file when several are checked at once.
+            label = display_name(message_type, content, name)
+            target, prefix = source_id, f"File: {label}\n"
+            fetch = lambda folder: download(source_id, content["file_key"], name, folder)
         with tempfile.TemporaryDirectory() as folder:
-            path = download(source_id, content["file_key"], name, Path(folder))
+            path = fetch(Path(folder))
+            if label is None:
+                label, prefix = path.name, f"File: {path.name}\n"
             reply(target, f"{prefix}Checking. This usually takes under a minute.")
             report = detect_ai.detect(path, active, DETECT_ARGS, escalate=True)
-        log_report(name, report)
+        log_report(label, report)
         reply(target, format_report(report, label))
     except UserError as e:
         log.warning("message %s: %s", message.message_id, e)

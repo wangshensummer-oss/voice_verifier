@@ -48,12 +48,16 @@ class Job:
     already_done: int = 0
 
 
-def find_link(content: str) -> tuple[str, str, str | None] | None:
-    """Return (kind, token, sheet_id) for the first sheet or wiki link in a message's content."""
+def message_text(content: str) -> str:
+    """A message's content as one searchable string, whatever its message type."""
     try:
-        text = json.dumps(json.loads(content), ensure_ascii=False)
+        return json.dumps(json.loads(content), ensure_ascii=False)
     except ValueError:
-        text = content
+        return content
+
+
+def find_link(text: str) -> tuple[str, str, str | None] | None:
+    """Return (kind, token, sheet_id) for the first Lark sheet or wiki link in the text."""
     match = SHEET_LINK.search(text)
     return match.groups() if match else None
 
@@ -73,7 +77,9 @@ def cell_text(cell) -> str:
     if isinstance(cell, list):
         return "".join(cell_text(part) for part in cell)
     if isinstance(cell, dict):
-        return str(cell.get("text") or "")
+        # A hyperlinked cell shows its text but the address is what a link check needs.
+        text, link = str(cell.get("text") or ""), str(cell.get("link") or "")
+        return text if not link or link in text else f"{text} {link}"
     return str(cell)
 
 

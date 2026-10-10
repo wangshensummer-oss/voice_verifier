@@ -11,6 +11,8 @@
 
 `scripts/lark_bot.py` 让同事在 Lark 里直接做 AI 声音检测：私聊把音频文件发给 bot，或在群里回复音频文件消息并 @bot，bot 回复检测结论。
 
+链接检测：把录音的 Google Drive 分享链接发给 bot（文件需设为“知道链接的任何人可查看”）；批量表格的 `Attachment` 单元格里放这种链接也可以。出于安全考虑只抓取已支持的网盘，不抓任意网址。
+
 批量检测：把一个 Lark Sheet 的链接发给 bot（群里需 @bot）。表格第一行是表头，约定两列：`File`（文件说明）和 `Attachment`（每行放一个音频附件），bot 逐行检测，把和聊天回复相同的三项结果写进 `Voice AI or Real`、`AI likelihood`、`Details` 三列（表里没有的列会自动加在最后一个表头之后）。已有结果的行会跳过，`Voice AI or Real` 为 `Failed` 的行会重试。需要额外的权限：查看、编辑电子表格（`sheets:spreadsheet`），下载云文档中的附件（`drive:drive` 或 `docs:document.media:download`），表格在知识库里时还需要 `wiki:wiki:readonly`；并且要在表格的"更多 → 添加文档应用"里给 bot 编辑权限。
 
 1. 在 Lark 开发者后台创建企业自建应用，开启机器人能力。
