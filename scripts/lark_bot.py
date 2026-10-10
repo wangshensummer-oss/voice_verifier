@@ -4,8 +4,8 @@
   Single check, direct chat: send the bot an audio file.
   Single check, group chat:  reply to the audio file's message and @ the bot.
   Batch check: send the bot (in a group, @ it with) a link to a Lark Sheet that
-               has an "Attachment" column of audio attachments; verdicts are written
-               to its "conclusion" column. See lark_sheet.py.
+               has an "Attachment" column of audio attachments; the same result
+               fields are written into the sheet. See lark_sheet.py.
 
 Connects out to Lark over a long connection, so no public URL is needed.
 Needs LARK_APP_ID and LARK_APP_SECRET in the environment / .env, plus at least
@@ -61,7 +61,7 @@ VERDICT_TEXT = {
 USAGE = (
     "To check one recording, send me the audio file directly; in a group, reply to that file's message and @ me.\n"
     "To check many, send me a link to a Lark Sheet with an 'Attachment' column of audio attachments; "
-    f"I write the results into its '{lark_sheet.CONCLUSION}' and '{lark_sheet.DETAILS}' columns."
+    "I write the same result into the sheet, one row per recording."
 )
 UNEXPECTED = "Something went wrong on my side. Please try again; if it keeps failing, tell the bot's maintainer."
 DOWNLOAD_ATTEMPTS = 3
@@ -175,20 +175,32 @@ def percent(score: float) -> str:
     return f"{round(score * 100)}%"
 
 
-def explain(report: dict) -> list[str]:
-    """The lines under a verdict: one likelihood figure per check that ran, and why a review is needed.
+CHECK_LABEL = {"real": "Real", "fake": "AI", "partial": "Partly AI"}
+ORDINALS = ("first check", "second check", "third check")
+# Why a check gave no result, by what its error text contains. The text itself
+# (hosts, endpoints, exception names) stays in the log.
+NO_RESULT_REASONS = (
+    ("insufficient balance", "out of credit"),
+    ("unsupported file type", "file type not supported"),
+    ("no speech", "no speech found"),
+    ("still processing", "timed out"),
+    ("timed out", "timed out"),
+    ("timeout", "timed out"),
+)
 
-    The same wording is used for every result. Detector names, raw metrics and
-    error text stay in the log.
-    """
-    results = list(report["providers"].values())
-    scores = [r["score"] for r in results if r["label"] != "unknown" and r["score"] is not None]
-    order = ("first check", "second check", "third check")
-    lines = []
+
+def likelihood(report: dict) -> str:
+    """The AI likelihood of each check that reached a verdict, as percentages."""
+    scores = [r["score"] for r in report["providers"].values() if r["label"] != "unknown" and r["score"] is not None]
     if len(scores) == 1:
-        lines.append(f"AI likelihood: {percent(scores[0])}")
-    elif scores:
-        lines.append("AI likelihood: " + ", ".join(f"{percent(s)} ({order[i]})" for i, s in enumerate(scores)))
+        return percent(scores[0])
+    return ", ".join(f"{percent(score)} ({ORDINALS[i]})" for i, score in enumerate(scores))
+
+
+def details(report: dict) -> list[str]:
+    """Why a review is needed, then what each check found, in the same terms whichever detector ran it."""
+    results = list(report["providers"].values())
+    lines = []
     if report["verdict"] == "REVIEW":
         labels = {r["label"] for r in results}
         if {"fake", "real"} <= labels:
@@ -197,11 +209,31 @@ def explain(report: dict) -> list[str]:
             lines.append("Part of the recording looks AI-generated, so please listen to it yourself.")
         else:
             lines.append("The check could not be completed. Please try again in a few minutes.")
+    for number, r in enumerate(results, start=1):
+        if r["label"] == "unknown":
+            text = r["detail"].lower()
+            reason = next((reason for needle, reason in NO_RESULT_REASONS if needle in text), "service error")
+            lines.append(f"Check {number}: no result ({reason})")
+            continue
+        parts = [CHECK_LABEL[r["label"]]]
+        if r["score"] is not None:
+            parts.append(f"AI likelihood {percent(r['score'])}")
+        if r["fields"].get("Peak_frame") is not None:
+            parts.append(f"most suspicious segment {percent(float(r['fields']['Peak_frame']))}")
+        if r["fields"].get("Consistency") is not None:
+            parts.append(f"consistency across segments {round(float(r['fields']['Consistency']))}%")
+        lines.append(f"Check {number}: " + ", ".join(parts))
     return lines
 
 
 def format_report(report: dict, name: str) -> str:
-    return "\n".join([f"File: {name}", f"Voice AI or Real: {VERDICT_TEXT[report['verdict']]}"] + explain(report))
+    lines = [
+        f"File: {name}",
+        f"Voice AI or Real: {VERDICT_TEXT[report['verdict']]}",
+        f"AI likelihood: {likelihood(report) or 'not available'}",
+        "Details:",
+    ]
+    return "\n".join(lines + details(report))
 
 
 def log_report(name: str, report: dict) -> None:
@@ -222,21 +254,21 @@ def display_name(message_type: str, content: dict, name: str) -> str:
     return f"{kind} ({seconds // 60}:{seconds % 60:02d})"
 
 
-def check_row(row: lark_sheet.Row) -> tuple[str, str]:
-    """Run detection for one sheet row and return its conclusion and details cells."""
+def check_row(row: lark_sheet.Row) -> list[str]:
+    """Run detection for one sheet row and return its lark_sheet.OUTPUTS cells."""
     if row.file_token is None:
-        return lark_sheet.FAILED, "No audio attachment in the 'Attachment' cell."
+        return [lark_sheet.FAILED, "", "No audio attachment in the 'Attachment' cell."]
     try:
         with tempfile.TemporaryDirectory() as folder:
             path = download_attachment(row.file_token, Path(row.name).name, Path(folder))
             report = detect_ai.detect(path, active, DETECT_ARGS, escalate=True)
     except UserError as e:
-        return lark_sheet.FAILED, str(e)
+        return [lark_sheet.FAILED, "", str(e)]
     except Exception as e:
         log.exception("row %d (%s) failed", row.number, row.name)
-        return lark_sheet.FAILED, UNEXPECTED
+        return [lark_sheet.FAILED, "", UNEXPECTED]
     log_report(f"row {row.number} ({row.name})", report)
-    return VERDICT_TEXT[report["verdict"]], "\n".join(explain(report))
+    return [VERDICT_TEXT[report["verdict"]], likelihood(report), "\n".join(details(report))]
 
 
 def handle_batch(message, kind: str, token: str, sheet_id: str | None) -> None:
@@ -245,12 +277,12 @@ def handle_batch(message, kind: str, token: str, sheet_id: str | None) -> None:
     prefix = f"Sheet: {job.title}\n"
     with batches_lock:
         if job.token in batches_running:
-            reply(target, f"{prefix}I am already checking this sheet. Results appear in the '{lark_sheet.CONCLUSION}' column.")
+            reply(target, f"{prefix}I am already checking this sheet. Results appear in the sheet as each row finishes.")
             return
         batches_running.add(job.token)
     try:
         rows, later = job.rows[:BATCH_ROWS], len(job.rows[BATCH_ROWS:])
-        skipped = f" {job.already_done} row(s) already have a conclusion and are skipped." if job.already_done else ""
+        skipped = f" {job.already_done} row(s) already have a result and are skipped." if job.already_done else ""
         if not rows:
             nothing = skipped or " No row has a recording in the 'Attachment' column."
             reply(target, f"{prefix}Nothing to check.{nothing}")
@@ -258,13 +290,13 @@ def handle_batch(message, kind: str, token: str, sheet_id: str | None) -> None:
         reply(
             target,
             f"{prefix}Checking {len(rows)} recording(s). Each result is written to the "
-            f"'{lark_sheet.CONCLUSION}' and '{lark_sheet.DETAILS}' columns as it finishes.{skipped}",
+            f"'{lark_sheet.OUTPUTS[0]}', '{lark_sheet.OUTPUTS[1]}' and '{lark_sheet.OUTPUTS[2]}' columns as it finishes.{skipped}",
         )
         counts: Counter = Counter()
         for row in rows:
-            conclusion, details = check_row(row)
-            lark_sheet.write(client, job, row.number, conclusion, details)
-            counts[conclusion] += 1
+            cells = check_row(row)
+            lark_sheet.write(client, job, row.number, cells)
+            counts[cells[0]] += 1
         log.info("sheet %s: %s", job.title, dict(counts))
         summary = ", ".join(f"{label} {counts[label]}" for label in ("Real", "AI", "Needs review", "Failed") if counts[label])
         more = f"\n{later} more row(s) are waiting; send me the link again to continue." if later else ""
