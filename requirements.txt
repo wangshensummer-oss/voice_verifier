@@ -4,5 +4,6 @@ soundfile
 torch
 torchaudio
 speechbrain>=1.0
+lark-oapi
 # optional, enables the Reality Defender provider in detect_ai.py
 # realitydefender

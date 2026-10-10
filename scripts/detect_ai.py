@@ -147,6 +147,21 @@ def overall(results: dict[str, dict]) -> str:
     return "PASS" if len(labels) > 1 else "PASS (single detector)"
 
 
+def configured(wanted: list[str] | None = None) -> list[str]:
+    """Providers that have an API key set, in the order given."""
+    return [name for name in (wanted or PROVIDERS) if os.environ.get(PROVIDERS[name][0])]
+
+
+def detect(path: Path, active: list[str], args: argparse.Namespace) -> dict:
+    results = {}
+    for name in active:
+        try:
+            results[name] = PROVIDERS[name][1](path, args)
+        except Exception as e:  # one provider failing must not hide the others
+            results[name] = result("unknown", detail=f"error: {e}")
+    return {"file": str(path), "verdict": overall(results), "providers": results}
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("files", nargs="+", type=Path)
@@ -164,7 +179,7 @@ def main() -> int:
     unknown = [name for name in wanted if name not in PROVIDERS]
     if unknown:
         parser.error(f"unknown provider(s): {', '.join(unknown)}")
-    active = [name for name in wanted if os.environ.get(PROVIDERS[name][0])]
+    active = configured(wanted)
     if not active:
         keys = ", ".join(PROVIDERS[name][0] for name in wanted)
         print(f"No detector is configured. Set at least one of: {keys}", file=sys.stderr)
@@ -175,13 +190,7 @@ def main() -> int:
         if not path.is_file():
             print(f"{path}: not a file", file=sys.stderr)
             return 2
-        results = {}
-        for name in active:
-            try:
-                results[name] = PROVIDERS[name][1](path, args)
-            except Exception as e:  # one provider failing must not hide the others
-                results[name] = result("unknown", detail=f"error: {e}")
-        report.append({"file": str(path), "verdict": overall(results), "providers": results})
+        report.append(detect(path, active, args))
 
     if args.json:
         print(json.dumps(report, indent=2, ensure_ascii=False))
