@@ -94,8 +94,21 @@ def modulate(path: Path, args: argparse.Namespace) -> dict:
 def resemble(path: Path, args: argparse.Namespace) -> dict:
     headers = {"Authorization": f"Bearer {os.environ['RESEMBLE_API_KEY']}"}
     data = {"zero_retention_mode": "true"} if args.zero_retention else {}
-    with path.open("rb") as f:
-        r = http.post(RESEMBLE_URL, headers=headers, files={"file": (path.name, f)}, data=data, timeout=300)
+
+    def submit(extra: dict) -> requests.Response:
+        with path.open("rb") as f:
+            return http.post(
+                RESEMBLE_URL, headers=headers, files={"file": (path.name, f)}, data={**data, **extra}, timeout=300
+            )
+
+    # Resemble bills per second analysed, so only send the opening of the clip.
+    max_seconds = float(os.environ.get("RESEMBLE_MAX_SECONDS", "20"))
+    if max_seconds > 0:
+        r = submit({"start_region": "0", "end_region": str(max_seconds)})
+        if r.status_code == 422 and "outside the media duration" in r.text:
+            r = submit({})  # the clip is shorter than the cap
+    else:
+        r = submit({})
     check(r)
     item = r.json()["item"]
 
