@@ -11,7 +11,7 @@
 
 `scripts/lark_bot.py` 让同事在 Lark 里直接做 AI 声音检测：私聊把音频文件发给 bot，或在群里回复音频文件消息并 @bot，bot 回复检测结论。
 
-批量检测：把一个 Lark Sheet 的链接发给 bot（群里需 @bot）。表格第一行是表头，`voice` 列每行放一个音频附件，bot 逐行检测并把结论写进 `conclusion` 列（没有就自动加在最后一个表头之后）。已有结论的行会跳过，`Failed:` 开头的行会重试。需要额外的权限：查看、编辑电子表格（`sheets:spreadsheet`），下载云文档中的附件（`drive:drive` 或 `docs:document.media:download`），表格在知识库里时还需要 `wiki:wiki:readonly`；并且要在表格的"更多 → 添加文档应用"里给 bot 编辑权限。
+批量检测：把一个 Lark Sheet 的链接发给 bot（群里需 @bot）。表格第一行是表头，约定两列：`File`（文件说明）和 `Attachment`（每行放一个音频附件），bot 逐行检测并把结论写进 `conclusion` 列（没有就自动加在最后一个表头之后）。已有结论的行会跳过，`Failed:` 开头的行会重试。需要额外的权限：查看、编辑电子表格（`sheets:spreadsheet`），下载云文档中的附件（`drive:drive` 或 `docs:document.media:download`），表格在知识库里时还需要 `wiki:wiki:readonly`；并且要在表格的"更多 → 添加文档应用"里给 bot 编辑权限。
 
 1. 在 Lark 开发者后台创建企业自建应用，开启机器人能力。
 2. 权限：读取私聊消息、读取群内 @机器人的消息、获取消息中的资源文件、以机器人身份发消息。

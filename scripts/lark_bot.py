@@ -4,7 +4,7 @@
   Single check, direct chat: send the bot an audio file.
   Single check, group chat:  reply to the audio file's message and @ the bot.
   Batch check: send the bot (in a group, @ it with) a link to a Lark Sheet that
-               has a "voice" column of audio attachments; verdicts are written
+               has an "Attachment" column of audio attachments; verdicts are written
                to its "conclusion" column. See lark_sheet.py.
 
 Connects out to Lark over a long connection, so no public URL is needed.
@@ -60,7 +60,7 @@ VERDICT_TEXT = {
 }
 USAGE = (
     "To check one recording, send me the audio file directly; in a group, reply to that file's message and @ me.\n"
-    f"To check many, send me a link to a Lark Sheet with a '{lark_sheet.VOICE}' column of audio attachments; "
+    "To check many, send me a link to a Lark Sheet with an 'Attachment' column of audio attachments; "
     f"I write the results into its '{lark_sheet.CONCLUSION}' column."
 )
 DOWNLOAD_ATTEMPTS = 3
@@ -193,7 +193,7 @@ def display_name(message_type: str, content: dict, name: str) -> str:
 def check_row(row: lark_sheet.Row) -> str:
     """Run detection for one sheet row and return the text for its conclusion cell."""
     if row.file_token is None:
-        return f"{lark_sheet.FAILED_PREFIX} no audio attachment in the '{lark_sheet.VOICE}' cell"
+        return f"{lark_sheet.FAILED_PREFIX} no audio attachment in the 'Attachment' cell"
     try:
         with tempfile.TemporaryDirectory() as folder:
             path = download_attachment(row.file_token, Path(row.name).name, Path(folder))
@@ -222,7 +222,7 @@ def handle_batch(message, kind: str, token: str, sheet_id: str | None) -> None:
         rows, later = job.rows[:BATCH_ROWS], len(job.rows[BATCH_ROWS:])
         skipped = f" {job.already_done} row(s) already have a conclusion and are skipped." if job.already_done else ""
         if not rows:
-            reply(target, f"{prefix}Nothing to check.{skipped or f' No row has a recording in the {lark_sheet.VOICE!r} column.'}")
+            reply(target, f"{prefix}Nothing to check.{skipped or " No row has a recording in the 'Attachment' column."}")
             return
         reply(
             target,

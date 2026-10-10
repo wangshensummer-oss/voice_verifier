@@ -1,6 +1,6 @@
 """Batch checking: find the recordings in a Lark Sheet and write verdicts back to it.
 
-The sheet needs a header row and a "voice" column holding one audio
+The sheet needs a header row and an "Attachment" column holding one audio
 attachment per row; if no column has that name, the only column containing
 attachments is used. Verdicts go into the "conclusion" column, which is added
 after the last header if the sheet has none.
@@ -15,7 +15,8 @@ import lark_oapi as lark
 from lark_oapi.api.sheets.v3 import QuerySpreadsheetSheetRequest
 from lark_oapi.api.wiki.v2 import GetNodeSpaceRequest
 
-VOICE, CONCLUSION = "voice", "conclusion"
+# Header names, compared case-insensitively.
+VOICE, CONCLUSION = "attachment", "conclusion"
 FAILED_PREFIX = "Failed:"
 # Bounds on what is read from a sheet; real audition sheets are far smaller.
 MAX_COLUMNS, MAX_SHEET_ROWS = 100, 5000
@@ -140,7 +141,7 @@ def plan(client: lark.Client, kind: str, token: str, sheet_id: str | None) -> Jo
         holding = {i for row in values[1:] for i, cell in enumerate(row) if attachments(cell)}
         if len(holding) != 1:
             raise UserError(
-                f"The sheet '{sheet.title}' has no '{VOICE}' column. Name the column with the recordings '{VOICE}'."
+                f"The sheet '{sheet.title}' has no 'Attachment' column. Put the recordings in a column named 'Attachment'."
             )
         voice = holding.pop()
     if CONCLUSION in header:
