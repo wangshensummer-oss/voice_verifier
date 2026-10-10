@@ -61,7 +61,7 @@ VERDICT_TEXT = {
 USAGE = (
     "To check one recording, send me the audio file directly; in a group, reply to that file's message and @ me.\n"
     "To check many, send me a link to a Lark Sheet with an 'Attachment' column of audio attachments; "
-    f"I write the results into its '{lark_sheet.CONCLUSION}' column."
+    f"I write the results into its '{lark_sheet.CONCLUSION}' and '{lark_sheet.DETAILS}' columns."
 )
 DOWNLOAD_ATTEMPTS = 3
 DOWNLOAD_CHUNK = 8 * 1024 * 1024
@@ -190,23 +190,34 @@ def display_name(message_type: str, content: dict, name: str) -> str:
     return f"{kind} ({seconds // 60}:{seconds % 60:02d})"
 
 
-def check_row(row: lark_sheet.Row) -> str:
-    """Run detection for one sheet row and return the text for its conclusion cell."""
+def describe(report: dict) -> str:
+    """One line per detector with its label and metrics, for the sheet's details column."""
+    parts = []
+    for provider, r in report["providers"].items():
+        metrics = [f"{key} {value}" for key, value in r["fields"].items() if value is not None]
+        if r["label"] == "unknown" and r["detail"]:
+            metrics.append(r["detail"])
+        parts.append(", ".join([f"{provider}: {r['label']}"] + metrics))
+    return "\n".join(parts)
+
+
+def check_row(row: lark_sheet.Row) -> tuple[str, str]:
+    """Run detection for one sheet row and return its conclusion and details cells."""
     if row.file_token is None:
-        return f"{lark_sheet.FAILED_PREFIX} no audio attachment in the 'Attachment' cell"
+        return lark_sheet.FAILED, "No audio attachment in the 'Attachment' cell."
     try:
         with tempfile.TemporaryDirectory() as folder:
             path = download_attachment(row.file_token, Path(row.name).name, Path(folder))
             report = detect_ai.detect(path, active, DETECT_ARGS, escalate=True)
     except UserError as e:
-        return f"{lark_sheet.FAILED_PREFIX} {e}"
+        return lark_sheet.FAILED, str(e)
     except Exception as e:
         log.exception("row %d (%s) failed", row.number, row.name)
-        return f"{lark_sheet.FAILED_PREFIX} {type(e).__name__}: {e}"
+        return lark_sheet.FAILED, f"{type(e).__name__}: {e}"
     for provider, r in report["providers"].items():
         if r["label"] == "unknown":
             log.warning("row %d (%s): %s gave no verdict: %s", row.number, row.name, provider, r["detail"])
-    return VERDICT_TEXT[report["verdict"]]
+    return VERDICT_TEXT[report["verdict"]], describe(report)
 
 
 def handle_batch(message, kind: str, token: str, sheet_id: str | None) -> None:
@@ -228,13 +239,13 @@ def handle_batch(message, kind: str, token: str, sheet_id: str | None) -> None:
         reply(
             target,
             f"{prefix}Checking {len(rows)} recording(s). Each result is written to the "
-            f"'{lark_sheet.CONCLUSION}' column as it finishes.{skipped}",
+            f"'{lark_sheet.CONCLUSION}' and '{lark_sheet.DETAILS}' columns as it finishes.{skipped}",
         )
         counts: Counter = Counter()
         for row in rows:
-            text = check_row(row)
-            lark_sheet.write(client, job, row.number, text)
-            counts["Failed" if text.startswith(lark_sheet.FAILED_PREFIX) else text] += 1
+            conclusion, details = check_row(row)
+            lark_sheet.write(client, job, row.number, conclusion, details)
+            counts[conclusion] += 1
         log.info("sheet %s: %s", job.title, dict(counts))
         summary = ", ".join(f"{label} {counts[label]}" for label in ("Real", "AI", "Needs review", "Failed") if counts[label])
         more = f"\n{later} more row(s) are waiting; send me the link again to continue." if later else ""

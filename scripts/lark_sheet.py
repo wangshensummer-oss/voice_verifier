@@ -2,8 +2,9 @@
 
 The sheet needs a header row and an "Attachment" column holding one audio
 attachment per row; if no column has that name, the only column containing
-attachments is used. Verdicts go into the "conclusion" column, which is added
-after the last header if the sheet has none.
+attachments is used. Verdicts go into the "conclusion" column and the scores
+or failure reason into the "details" column; both are added after the last
+header if the sheet has neither.
 """
 from __future__ import annotations
 
@@ -16,8 +17,8 @@ from lark_oapi.api.sheets.v3 import QuerySpreadsheetSheetRequest
 from lark_oapi.api.wiki.v2 import GetNodeSpaceRequest
 
 # Header names, compared case-insensitively.
-VOICE, CONCLUSION = "attachment", "conclusion"
-FAILED_PREFIX = "Failed:"
+VOICE, CONCLUSION, DETAILS = "attachment", "conclusion", "details"
+FAILED = "Failed"
 # Bounds on what is read from a sheet; real audition sheets are far smaller.
 MAX_COLUMNS, MAX_SHEET_ROWS = 100, 5000
 
@@ -41,7 +42,8 @@ class Job:
     token: str
     sheet_id: str
     title: str
-    conclusion_column: str
+    conclusion_column: int  # 0-based
+    details_column: int
     rows: list[Row] = field(default_factory=list)
     already_done: int = 0
 
@@ -144,23 +146,32 @@ def plan(client: lark.Client, kind: str, token: str, sheet_id: str | None) -> Jo
                 f"The sheet '{sheet.title}' has no 'Attachment' column. Put the recordings in a column named 'Attachment'."
             )
         voice = holding.pop()
-    if CONCLUSION in header:
-        conclusion = header.index(CONCLUSION)
-    else:
-        conclusion = max((i for i, name in enumerate(header) if name), default=0) + 1
-        if conclusion >= columns:
-            raise UserError(f"There is no free column for '{CONCLUSION}'. Add a column named '{CONCLUSION}' and try again.")
+    def free_column(after: int, name: str) -> int:
+        if after + 1 >= columns:
+            raise UserError(f"There is no free column for '{name}'. Add a column named '{name}' and try again.")
+        return after + 1
 
-    job = Job(token, sheet.sheet_id, sheet.title, column_letter(conclusion))
-    if CONCLUSION not in header:
-        write(client, job, 1, CONCLUSION)
+    last_header = max((i for i, name in enumerate(header) if name), default=0)
+    conclusion = header.index(CONCLUSION) if CONCLUSION in header else free_column(last_header, CONCLUSION)
+    if DETAILS in header:
+        details = header.index(DETAILS)
+    elif conclusion + 1 < len(header) and header[conclusion + 1]:
+        # The column after the conclusion is taken, so go past everything.
+        details = free_column(max(last_header, conclusion), DETAILS)
+    else:
+        details = free_column(conclusion, DETAILS)
+
+    job = Job(token, sheet.sheet_id, sheet.title, conclusion, details)
+    for index, name in ((conclusion, CONCLUSION), (details, DETAILS)):
+        if name not in header:
+            put(client, job, f"{column_letter(index)}1", [[name]])
     for number, row in enumerate(values[1:], start=2):
         voice_cell = row[voice] if voice < len(row) else None
         if not cell_text(voice_cell).strip() and not attachments(voice_cell):
             continue
         existing = cell_text(row[conclusion] if conclusion < len(row) else None).strip()
         # Rows that failed last time are tried again.
-        if existing and not existing.startswith(FAILED_PREFIX):
+        if existing and not existing.startswith(FAILED):
             job.already_done += 1
             continue
         found = attachments(voice_cell)
@@ -168,7 +179,15 @@ def plan(client: lark.Client, kind: str, token: str, sheet_id: str | None) -> Jo
     return job
 
 
-def write(client: lark.Client, job: Job, row: int, text: str) -> None:
-    cell = f"{job.sheet_id}!{job.conclusion_column}{row}:{job.conclusion_column}{row}"
-    body = {"valueRange": {"range": cell, "values": [[text]]}}
+def put(client: lark.Client, job: Job, cells: str, values: list[list[str]]) -> None:
+    body = {"valueRange": {"range": f"{job.sheet_id}!{cells}", "values": values}}
     call(client, lark.HttpMethod.PUT, f"/open-apis/sheets/v2/spreadsheets/{job.token}/values", body)
+
+
+def write(client: lark.Client, job: Job, row: int, conclusion: str, details: str) -> None:
+    first, second = column_letter(job.conclusion_column), column_letter(job.details_column)
+    if job.details_column == job.conclusion_column + 1:
+        put(client, job, f"{first}{row}:{second}{row}", [[conclusion, details]])
+    else:
+        put(client, job, f"{first}{row}:{first}{row}", [[conclusion]])
+        put(client, job, f"{second}{row}:{second}{row}", [[details]])
