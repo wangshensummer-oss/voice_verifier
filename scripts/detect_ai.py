@@ -159,10 +159,12 @@ PROVIDERS = {
 def overall(results: dict[str, dict]) -> str:
     labels = [r["label"] for r in results.values()]
     if "fake" in labels:
-        return "FLAG"
-    if "partial" in labels or "unknown" in labels:
+        # Detectors that disagree are a reason to listen, not a verdict.
+        return "REVIEW" if "real" in labels else "FLAG"
+    # A detector that errored does not block a verdict another one reached.
+    if "partial" in labels or "real" not in labels:
         return "REVIEW"
-    return "PASS" if len(labels) > 1 else "PASS (single detector)"
+    return "PASS" if labels.count("real") > 1 else "PASS (single detector)"
 
 
 def configured(wanted: list[str] | None = None) -> list[str]:
@@ -170,13 +172,20 @@ def configured(wanted: list[str] | None = None) -> list[str]:
     return [name for name in (wanted or PROVIDERS) if os.environ.get(PROVIDERS[name][0])]
 
 
-def detect(path: Path, active: list[str], args: argparse.Namespace) -> dict:
+def detect(path: Path, active: list[str], args: argparse.Namespace, escalate: bool = False) -> dict:
+    """Run the detectors on one file.
+
+    With escalate, the first detector decides alone when it says "real"; the
+    others (which may cost far more per call) run only as a second opinion.
+    """
     results = {}
     for name in active:
         try:
             results[name] = PROVIDERS[name][1](path, args)
         except Exception as e:  # one provider failing must not hide the others
             results[name] = result("unknown", detail=f"error: {e}")
+        if escalate and results[name]["label"] == "real":
+            break
     return {"file": str(path), "verdict": overall(results), "providers": results}
 
 
@@ -187,6 +196,7 @@ def main() -> int:
     parser.add_argument("--zero-retention", action="store_true", help="ask providers that support it to delete the audio after analysis")
     parser.add_argument("--timeout", type=int, default=180, help="seconds to wait for async providers")
     parser.add_argument("--proxy", help="proxy URL to use for detector requests (default: connect directly)")
+    parser.add_argument("--escalate", action="store_true", help="run later providers only when the first one does not say real")
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
 
@@ -208,7 +218,7 @@ def main() -> int:
         if not path.is_file():
             print(f"{path}: not a file", file=sys.stderr)
             return 2
-        report.append(detect(path, active, args))
+        report.append(detect(path, active, args, args.escalate))
 
     if args.json:
         print(json.dumps(report, indent=2, ensure_ascii=False))

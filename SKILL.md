@@ -26,7 +26,8 @@ $SKILL/.venv/bin/python $SKILL/scripts/detect_ai.py <音频...> [--json] [--zero
 ```
 
 - 会调用 `.env` 里配置了 key 的所有检测器（Modulate、Resemble Detect、Reality Defender），逐个列出结论，再给一个综合结论。
-- 综合规则：任一检测器判 fake → `FLAG`；有检测器判"部分合成"或结果缺失 → `REVIEW`；全部判 real → `PASS`（只有一个检测器时会标注 single detector）。
+- 综合规则：给出结论的检测器都判 fake → `FLAG`；检测器之间意见不一、有检测器判"部分合成"、或没有任何一家给出结论 → `REVIEW`；其余情况（给出结论的都判 real）→ `PASS`（只有一家给出结论时会标注 single detector）。某一家报错不影响其他家已得出的结论。
+- 加 `--escalate` 时先只跑第一家（按 Modulate、Resemble、Reality Defender 的顺序），它判 real 就不再调用后面的；否则才调用其余几家做复核。Resemble 按秒计费且贵得多，日常筛查建议加这个参数。Lark bot 默认就是这个模式。
 - 不要把几家的分数平均成一个"概率"，它们的分数没有校准到同一尺度。
 - 音频会被上传到第三方。候选人的声音是个人敏感信息，默认建议加 `--zero-retention`（目前只有 Resemble 支持该参数）。
 - ElevenLabs 的 AI Speech Classifier 只对 ElevenLabs 自家生成的音频可靠，没有确认到可用的公开 API，所以不在脚本里；需要时让用户在网页上手动查，结果只当"是否出自 ElevenLabs"的旁证。

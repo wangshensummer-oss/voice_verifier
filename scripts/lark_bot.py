@@ -120,7 +120,7 @@ def handle(message) -> None:
         reply(message.message_id, f"Got {name}. Checking, this usually takes under a minute.")
         with tempfile.TemporaryDirectory() as folder:
             path = download(source_id, content["file_key"], name, Path(folder))
-            report = detect_ai.detect(path, active, DETECT_ARGS)
+            report = detect_ai.detect(path, active, DETECT_ARGS, escalate=True)
         log.info("%s -> %s", name, report["verdict"])
         reply(message.message_id, format_report(report, name))
     except Exception as e:
