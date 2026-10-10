@@ -222,7 +222,8 @@ def handle_batch(message, kind: str, token: str, sheet_id: str | None) -> None:
         rows, later = job.rows[:BATCH_ROWS], len(job.rows[BATCH_ROWS:])
         skipped = f" {job.already_done} row(s) already have a conclusion and are skipped." if job.already_done else ""
         if not rows:
-            reply(target, f"{prefix}Nothing to check.{skipped or " No row has a recording in the 'Attachment' column."}")
+            nothing = skipped or " No row has a recording in the 'Attachment' column."
+            reply(target, f"{prefix}Nothing to check.{nothing}")
             return
         reply(
             target,
