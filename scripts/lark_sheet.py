@@ -108,7 +108,10 @@ def call(client: lark.Client, method: lark.HttpMethod, uri: str, body: dict | No
     except ValueError:
         raise UserError(f"Lark returned HTTP {raw.status_code} for the sheet. Please try again in a minute.")
     if payload.get("code") != 0:
-        raise UserError(f"Lark refused access to the sheet ({payload.get('code')}: {payload.get('msg')}). {SHARE_HINT}")
+        code, message = payload.get("code"), str(payload.get("msg"))
+        if "forbidden" in message.lower() or "permission" in message.lower():
+            raise UserError(f"Lark refused access to the sheet ({code}: {message}). {SHARE_HINT}")
+        raise UserError(f"Lark rejected the sheet request ({code}: {message}). Please tell the bot's maintainer.")
     return payload.get("data") or {}
 
 
@@ -168,7 +171,7 @@ def plan(client: lark.Client, kind: str, token: str, sheet_id: str | None) -> Jo
     job = Job(token, sheet.sheet_id, sheet.title, places)
     for index, name in zip(places, OUTPUTS):
         if name.lower() not in header:
-            put(client, job, f"{column_letter(index)}1", [[name]])
+            put(client, job, f"{column_letter(index)}1:{column_letter(index)}1", [[name]])
     verdict = places[0]
     for number, row in enumerate(values[1:], start=2):
         voice_cell = row[voice] if voice < len(row) else None
