@@ -143,6 +143,9 @@ def resemble(path: Path, args: argparse.Namespace) -> dict:
         score = float(metrics.get("aggregated_score"))
     except (TypeError, ValueError):
         score = None
+    # Resemble reports -1 when it could not analyse the audio, yet still labels the file "real".
+    if score is not None and score < 0:
+        return result("unknown", detail=f"could not analyse the audio ({detail})")
     return result(label, score, detail, fields)
 
 

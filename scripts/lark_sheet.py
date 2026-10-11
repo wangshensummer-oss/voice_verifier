@@ -10,10 +10,12 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from dataclasses import dataclass, field
 
 import lark_oapi as lark
-from lark_oapi.api.sheets.v3 import QuerySpreadsheetSheetRequest
+import requests
+from lark_oapi.api.sheets.v3 import GetSpreadsheetRequest, QuerySpreadsheetSheetRequest
 from lark_oapi.api.wiki.v2 import GetNodeSpaceRequest
 
 # Header names are compared case-insensitively.
@@ -92,6 +94,17 @@ def attachments(cell) -> list[tuple[str, str]]:
     return []
 
 
+def with_retry(send):
+    """Run one Lark request, retrying when the connection fails; the link to Lark drops now and then."""
+    for attempt in range(1, 4):
+        try:
+            return send()
+        except requests.RequestException:
+            if attempt == 3:
+                raise UserError("I lost the connection to Lark. Please try again in a minute.")
+            time.sleep(2 * attempt)
+
+
 def call(client: lark.Client, method: lark.HttpMethod, uri: str, body: dict | None = None) -> dict:
     """Call a Lark endpoint the SDK has no typed wrapper for and return its data."""
     request = (
@@ -102,7 +115,7 @@ def call(client: lark.Client, method: lark.HttpMethod, uri: str, body: dict | No
         .body(body)
         .build()
     )
-    raw = client.request(request).raw
+    raw = with_retry(lambda: client.request(request)).raw
     try:
         payload = json.loads(raw.content)
     except ValueError:
@@ -118,7 +131,7 @@ def call(client: lark.Client, method: lark.HttpMethod, uri: str, body: dict | No
 def plan(client: lark.Client, kind: str, token: str, sheet_id: str | None) -> Job:
     """Read the sheet and list the rows that still need a verdict."""
     if kind == "wiki":
-        response = client.wiki.v2.space.get_node(GetNodeSpaceRequest.builder().token(token).build())
+        response = with_retry(lambda: client.wiki.v2.space.get_node(GetNodeSpaceRequest.builder().token(token).build()))
         if not response.success():
             raise UserError(f"I could not open that wiki page ({response.code}: {response.msg}). {SHARE_HINT}")
         node = response.data.node
@@ -126,8 +139,10 @@ def plan(client: lark.Client, kind: str, token: str, sheet_id: str | None) -> Jo
             raise UserError(f"That wiki page is of type '{node.obj_type}', not a sheet. Send me the link to a Lark Sheet.")
         token = node.obj_token
 
-    response = client.sheets.v3.spreadsheet_sheet.query(
-        QuerySpreadsheetSheetRequest.builder().spreadsheet_token(token).build()
+    response = with_retry(
+        lambda: client.sheets.v3.spreadsheet_sheet.query(
+            QuerySpreadsheetSheetRequest.builder().spreadsheet_token(token).build()
+        )
     )
     if not response.success():
         raise UserError(f"I could not open that sheet ({response.code}: {response.msg}). {SHARE_HINT}")
@@ -168,7 +183,12 @@ def plan(client: lark.Client, kind: str, token: str, sheet_id: str | None) -> Jo
             raise UserError(f"There is no free column for '{name}'. Add a column named '{name}' and try again.")
         places.append(last_used)
 
-    job = Job(token, sheet.sheet_id, sheet.title, places)
+    # Name the spreadsheet in replies, not the tab, which is usually just "Sheet1".
+    info = with_retry(
+        lambda: client.sheets.v3.spreadsheet.get(GetSpreadsheetRequest.builder().spreadsheet_token(token).build())
+    )
+    title = info.data.spreadsheet.title if info.success() else sheet.title
+    job = Job(token, sheet.sheet_id, title, places)
     for index, name in zip(places, OUTPUTS):
         if name.lower() not in header:
             put(client, job, f"{column_letter(index)}1:{column_letter(index)}1", [[name]])

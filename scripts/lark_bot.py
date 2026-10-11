@@ -25,6 +25,7 @@ import sys
 import tempfile
 import threading
 import time
+import uuid
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -86,11 +87,19 @@ def reply(message_id: str, text: str) -> None:
         ReplyMessageRequest.builder()
         .message_id(message_id)
         .request_body(
-            ReplyMessageRequestBody.builder().msg_type("text").content(json.dumps({"text": text})).build()
+            ReplyMessageRequestBody.builder()
+            .msg_type("text")
+            .content(json.dumps({"text": text}))
+            .uuid(uuid.uuid4().hex)  # lets Lark drop the duplicate if a retry repeats a delivered reply
+            .build()
         )
         .build()
     )
-    response = client.im.v1.message.reply(request)
+    try:
+        response = lark_sheet.with_retry(lambda: client.im.v1.message.reply(request))
+    except UserError:
+        log.error("reply to %s could not be sent: %s", message_id, text)
+        return
     if not response.success():
         log.error("reply failed: %s %s", response.code, response.msg)
 
@@ -185,6 +194,7 @@ ORDINALS = ("first check", "second check", "third check")
 NO_RESULT_REASONS = (
     ("insufficient balance", "out of credit"),
     ("unsupported file type", "file type not supported"),
+    ("could not analyse", "could not read the audio"),
     ("no speech", "no speech found"),
     ("still processing", "timed out"),
     ("timed out", "timed out"),
